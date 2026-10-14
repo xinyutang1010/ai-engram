@@ -28,7 +28,7 @@ expert, so :func:`count_ratio` carries genuine per-expert weighting there.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 
@@ -74,6 +74,7 @@ class EngramResult:
 
     layers: Dict[str, LayerScaleInfo] = field(default_factory=dict)
     bias: Dict[str, torch.Tensor] = field(default_factory=dict)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
 ScaleFn = Callable[[Dict[str, "LayerScaleInfo"]], Dict[str, float]]

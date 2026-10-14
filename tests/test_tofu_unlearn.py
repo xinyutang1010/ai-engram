@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
 IGNORE = -100
 SYSTEM = "You are a helpful assistant."
 DATE = "10 Apr 2025"
-BASE_ID = "open-unlearning/tofu_Llama-3.2-1B-Instruct_full"
+BASE_ID = "/srv/scratch/z5773483/models/tofu_Llama-3.2-1B-Instruct_full"
 PLAIN_ALPHA = 0.6              # paper forget10 "plain"
 ADAPT_ALPHA, ADAPT_P = 1.0, 1  # paper forget10 "adaptive power-norm (p=1)"
 N_TOTAL = 4000                 # G_total sample count (preserves the alpha calibration)

@@ -235,10 +235,18 @@ def gen_texts(model, ds, coll, tok, bs=16):
             gens.append(g.split(eos)[0].strip() if eos in g else g.strip())
     return gens
 def gibberish_score(generations, device="cuda", bs=32, class_id=0):
+    import os
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    cid = "madhurjindal/autonlp-Gibberish-Detector-492513457"
-    ct = AutoTokenizer.from_pretrained(cid)
-    cm = AutoModelForSequenceClassification.from_pretrained(cid).to(device).eval()
+    # Keep full TOFU evaluation offline and reproducible on compute nodes.  The
+    # directory can be overridden when a different cached copy is desired.
+    cid = os.environ.get(
+        "TOFU_GIBBERISH_MODEL",
+        "/srv/scratch/z5773483/models/gibberish-detector",
+    )
+    ct = AutoTokenizer.from_pretrained(cid, local_files_only=True)
+    cm = AutoModelForSequenceClassification.from_pretrained(
+        cid, local_files_only=True
+    ).to(device).eval()
     probs = []
     for i in range(0, len(generations), bs):
         enc = ct(generations[i:i+bs], return_tensors="pt", padding=True, truncation=True, max_length=32).to(device)

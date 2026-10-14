@@ -31,8 +31,8 @@ pytestmark = pytest.mark.skipif(
     reason="very heavy TOFU evaluation; set ENGRAM_RUN_TOFU_EVALUATE=1 (GPU + cache)",
 )
 
-BASE_ID = "open-unlearning/tofu_Llama-3.2-1B-Instruct_full"
-RETAIN_ID = "open-unlearning/tofu_Llama-3.2-1B-Instruct_retain90"
+BASE_ID = "/srv/scratch/z5773483/models/tofu_Llama-3.2-1B-Instruct_full"
+RETAIN_ID = "/srv/scratch/z5773483/models/tofu_Llama-3.2-1B-Instruct_retain90"
 SPLIT, HOLDOUT = "forget10", "holdout10"
 N_TOTAL = 4000
 PLAIN_ALPHA = 0.6
@@ -115,9 +115,13 @@ def test_tofu_evaluate_overall():
 
     rt = T.compute_full_tofu(load(RETAIN_ID), tok, D)
 
-    o_gold = T.evaluate_scores(rt, rt, ft)["Overall"]
-    o_plain = T.evaluate_scores(exp_plain, rt, ft)["Overall"]
-    o_adapt = T.evaluate_scores(exp_adapt, rt, ft)["Overall"]
+    scores_gold = T.evaluate_scores(rt, rt, ft)
+    scores_plain = T.evaluate_scores(exp_plain, rt, ft)
+    scores_adapt = T.evaluate_scores(exp_adapt, rt, ft)
+    o_gold = scores_gold["Overall"]
+    o_plain = scores_plain["Overall"]
+    o_adapt = scores_adapt["Overall"]
+    print("\n[FULL METRICS]\n  gold:", scores_gold, "\n  plain:", scores_plain, "\n  adaptive:", scores_adapt)
 
     print(
         "\n[TOFU forget10 | Overall]   ours      paper     |diff|"

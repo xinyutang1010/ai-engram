@@ -24,9 +24,10 @@ from tqdm.auto import tqdm
 from .collectors import CovarianceCollector
 from .config import EditorConfig
 from .handlers import Conv1DHandler, LinearHandler, get_conv1d_class, handler_for
-from .scaling import EngramResult, LayerScaleInfo, ScaleFn, _erank, count_ratio
+from .scaling import EngramResult, LayerScaleInfo, ScaleFn, _erank, count_ratio, uniform
 from .stats import Statistics
 from .inverse import default_rtol, spectral_factors
+from .logdet import projected_engram_projection, select_logdet_subspace
 
 logger = logging.getLogger("engram")
 
@@ -363,12 +364,130 @@ class EngramEditor:
         return result
 
     @torch.no_grad()
+    def compute_logdet_engram_weights(
+        self,
+        forget_covariances: Statistics,
+        retain_covariances: Statistics,
+        total_covariance: Optional[Statistics] = None,
+        *,
+        rank_max: Optional[int] = None,
+        eta_select: float = 1e-4,
+        gamma_rtol: float = 1e-6,
+        logdet_fraction: float = 0.95,
+        gamma_floor: float = 1.0,
+        update_ridge_eta: float = 1e-4,
+        update_mode: str = "retain_optimal",
+        retain_lambda: float = 1.0,
+    ) -> EngramResult:
+        """Compute a guarded LogDet-subspace Engram.
+
+        LogDet selects a per-layer forget-heavy subspace from independently collected
+        forget/retain statistics. ``retain_optimal`` (the default) then solves the
+        retain-protected constrained quadratic in closed form; ``one_sided`` and
+        ``two_sided`` remain available as ablations. ``total_covariance`` is normally the
+        count-weighted merge of forget and retain statistics; it may be supplied separately
+        when the reference corpus is broader than their union.
+        """
+        if total_covariance is None:
+            total_covariance = self.merge_statistics(forget_covariances, retain_covariances)
+        missing = [k for k in forget_covariances if k not in retain_covariances or k not in total_covariance]
+        if missing:
+            warnings.warn(
+                f"compute_logdet_engram_weights: {len(missing)} layer(s) lack forget, retain, "
+                f"or total statistics and will be skipped (e.g. {missing[:3]})",
+                stacklevel=2,
+            )
+        result = EngramResult()
+        modules = dict(self.model.named_modules())
+        dev = self._model_device
+        for layer_name, raw_cf in tqdm(
+            forget_covariances.items(), disable=None, desc="Computing LogDet Engram"
+        ):
+            if layer_name in missing:
+                continue
+            cf = raw_cf.to(dev, dtype=torch.float32)
+            cr = retain_covariances[layer_name].to(dev, dtype=torch.float32)
+            ct = total_covariance[layer_name].to(dev, dtype=torch.float32)
+            n = int(forget_covariances.count.get(layer_name, 0))
+            r = int(retain_covariances.count.get(layer_name, 0))
+            N = int(total_covariance.count.get(layer_name, 0))
+            if n <= 0 or r <= 0 or N <= 0:
+                continue
+            # For the constrained objective, lambda is the neutral threshold:
+            # retain-dominant directions must not consume the rank budget.
+            selection_floor = retain_lambda if update_mode == "retain_optimal" else gamma_floor
+            if selection_floor <= 0:
+                raise ValueError("retain_lambda/gamma_floor must be positive")
+            layer_rank_max = None if rank_max is None else min(rank_max, cf.shape[0])
+            selection = select_logdet_subspace(
+                cf, cr, n, r, rank_max=layer_rank_max,
+                eta_select=eta_select, gamma_rtol=gamma_rtol,
+                logdet_fraction=logdet_fraction, gamma_floor=selection_floor,
+            )
+            if selection is None:
+                result.diagnostics[layer_name] = {"selected_rank": 0, "reason": "no_valid_gamma"}
+                continue
+            module = modules.get(layer_name)
+            if module is None:
+                adapter = next((a for a in self.adapters if a.owns(layer_name, self.model)), None)
+                if adapter is None:
+                    continue
+                w = adapter.weight_for(layer_name, self.model).to(dev, dtype=torch.float32)
+                proj, inv_rank = projected_engram_projection(
+                    w, cf, ct, selection.basis, update_ridge_eta=update_ridge_eta,
+                    update_mode=update_mode, retain_covariance=cr,
+                    forget_fraction=n / N, retain_fraction=r / N,
+                    retain_lambda=retain_lambda,
+                )
+                result.layers[layer_name] = LayerScaleInfo(
+                    name=layer_name, weight_fro=float(w.float().norm()), projection=proj,
+                    n=n, N=N,
+                )
+            else:
+                handler = handler_for(self.registry, module)
+                if handler is None:
+                    continue
+                in_dim = handler.get_input_dim(module, absorb_bias=False)
+                absorbed = ct.shape[0] == in_dim + 1 and getattr(module, "bias", None) is not None
+                w = handler.weight_matrix(module, absorb_bias=absorbed).to(dev, dtype=torch.float32)
+                full, inv_rank = projected_engram_projection(
+                    w, cf, ct, selection.basis, update_ridge_eta=update_ridge_eta,
+                    update_mode=update_mode, retain_covariance=cr,
+                    forget_fraction=n / N, retain_fraction=r / N,
+                    retain_lambda=retain_lambda,
+                )
+                if absorbed:
+                    result.bias[layer_name] = full[:, in_dim:].reshape(-1)
+                    proj = handler.to_weight_shape(full[:, :in_dim], module)
+                else:
+                    proj = handler.to_weight_shape(full, module)
+                result.layers[layer_name] = LayerScaleInfo(
+                    name=layer_name, weight_fro=float(module.weight.float().norm()),
+                    projection=proj, n=n, N=N,
+                )
+            result.diagnostics[layer_name] = {
+                "requested_rank": selection.requested_rank,
+                "selected_rank": selection.selected_rank,
+                "update_inverse_rank": inv_rank,
+                "ridge_select": selection.ridge,
+                "logdet_score": selection.logdet_score,
+                "generalized_residual": selection.generalized_residual,
+                "orthogonality_error": selection.orthogonality_error,
+                "update_mode": update_mode,
+                "retain_lambda": retain_lambda,
+                **selection.diagnostics,
+                "gamma": selection.gamma.detach().cpu().tolist(),
+            }
+        return result
+
+    @torch.no_grad()
     def apply(
         self,
         engram: EngramResult,
         *,
         alpha: float = 1.0,
         scale: Optional[ScaleFn] = None,
+        max_update_ratio: Optional[float] = None,
         inplace: bool = False,
     ) -> nn.Module:
         """Subtract the engram from the model: ``W <- W - alpha * f_l * P_l``.
@@ -381,6 +500,11 @@ class EngramEditor:
                 per-layer factor ``f_l``. Defaults to :func:`engram.scaling.count_ratio`
                 (``f_l = n / N``), which reproduces the paper. See :mod:`engram.scaling`
                 for ``weight_norm`` / ``effective_rank`` / ``uniform`` / ``compose``.
+            max_update_ratio: optional trust-region cap on each layer's applied update,
+                expressed as ``||delta W_l||_F / ||W_l||_F``.  This is applied after
+                ``alpha`` and ``scale``.  It is useful for nonlinear full-model edits,
+                where the linearized closed form does not by itself bound the change to
+                residual-stream activations.
             inplace: edit ``self.model`` in place; otherwise edit and return a deep copy.
 
         Returns:
@@ -389,6 +513,8 @@ class EngramEditor:
         """
         if scale is None:
             scale = count_ratio(1.0)
+        if max_update_ratio is not None and max_update_ratio <= 0:
+            raise ValueError("max_update_ratio must be positive when set")
         model = self.model if inplace else copy.deepcopy(self.model)
         modules = dict(model.named_modules())
         factors = scale(engram.layers)
@@ -397,6 +523,13 @@ class EngramEditor:
             s = alpha * float(factors.get(name, 0.0))
             if s == 0.0:
                 continue
+            # The projection is stored in the original weight scale.  Clip the actual
+            # applied delta, rather than changing the closed-form projection itself.
+            # This preserves the selected Q subspace and makes the trust region explicit.
+            if max_update_ratio is not None:
+                applied_ratio = abs(s) * float(info.projection.float().norm()) / max(info.weight_fro, 1e-30)
+                if applied_ratio > max_update_ratio:
+                    s *= max_update_ratio / applied_ratio
             module = modules.get(name)
             if module is not None:
                 module.weight.data -= (s * info.projection).to(module.weight.device, module.weight.dtype)
@@ -427,6 +560,38 @@ class EngramEditor:
             rank_fraction=rank_fraction, inverse_method=inverse_method,
         )
         return self.apply(engram, alpha=alpha, scale=scale, inplace=inplace)
+
+    def edit_logdet(
+        self,
+        forget_covariances: Statistics,
+        retain_covariances: Statistics,
+        total_covariance: Optional[Statistics] = None,
+        *,
+        alpha: float = 1.0,
+        scale: Optional[ScaleFn] = None,
+        rank_max: Optional[int] = None,
+        eta_select: float = 1e-4,
+        gamma_rtol: float = 1e-6,
+        logdet_fraction: float = 0.95,
+        gamma_floor: float = 1.0,
+        update_ridge_eta: float = 1e-4,
+        update_mode: str = "retain_optimal",
+        retain_lambda: float = 1.0,
+        max_update_ratio: Optional[float] = None,
+        inplace: bool = False,
+    ) -> nn.Module:
+        """Select a guarded LogDet subspace, compute the projected Engram, and apply it."""
+        result = self.compute_logdet_engram_weights(
+            forget_covariances, retain_covariances, total_covariance,
+            rank_max=rank_max, eta_select=eta_select,
+            gamma_rtol=gamma_rtol, logdet_fraction=logdet_fraction,
+            gamma_floor=gamma_floor, update_ridge_eta=update_ridge_eta,
+            update_mode=update_mode, retain_lambda=retain_lambda,
+        )
+        if update_mode == "retain_optimal" and scale is None:
+            scale = uniform()
+        return self.apply(result, alpha=alpha, scale=scale,
+                          max_update_ratio=max_update_ratio, inplace=inplace)
 
     def save_statistics(self, stats: Statistics, path: Union[str, Path]) -> None:
         """Save collected :class:`Statistics` (mean covariances + counts) with ``torch.save``."""

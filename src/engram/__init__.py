@@ -21,6 +21,7 @@ from .handlers import (
     handler_for,
 )
 from .llm import apply_engram, edit_llm, get_engram
+from .logdet import LogDetSelection, projected_engram_projection, safe_symmetric_pinv, select_logdet_subspace
 from .scaling import (
     EngramResult,
     LayerScaleInfo,
@@ -53,6 +54,10 @@ __all__ = [
     "LinearHandler",
     "Conv1DHandler",
     "handler_for",
+    "LogDetSelection",
+    "select_logdet_subspace",
+    "safe_symmetric_pinv",
+    "projected_engram_projection",
 ]
 
 __version__ = "0.11.0"

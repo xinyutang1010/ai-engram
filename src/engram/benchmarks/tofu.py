@@ -117,6 +117,23 @@ def load_splits(split: str = "forget10", n_total: int = 4000, seed: int = 0) -> 
     return d
 
 
+def load_logdet_training_splits(split: str = "forget10", seed: int = 0) -> Dict[str, Any]:
+    """Build disjoint target/retain/total *training* rows for LogDet selection.
+
+    ``retain_perturbed`` is an evaluation split and must not be used as the retain
+    training covariance.  The retain rows are therefore constructed from ``full`` by
+    removing the questions present in the target split.  This is TOFU-specific; other
+    tasks should provide their own target/retain loaders.
+    """
+    from datasets import load_dataset
+
+    target = load_dataset("locuslab/TOFU", f"{split}_perturbed")["train"]
+    full = load_dataset("locuslab/TOFU", "full")["train"]
+    target_questions = {row["question"] for row in target}
+    retain = full.filter(lambda row: row["question"] not in target_questions)
+    return {"forget": target, "retain_training": retain, "total_training": full}
+
+
 # --------------------------- scoring ---------------------------
 
 @torch.no_grad()
@@ -284,6 +301,38 @@ def collect(
         return st
 
     return one("target", splits["forget"]), one("reference", splits["total"]), editor
+
+
+def collect_logdet(
+    model,
+    tok,
+    splits: Dict[str, Any],
+    *,
+    device: str = "cuda",
+    bs: int = 8,
+    cache: Optional[Dict[str, str]] = None,
+) -> Tuple[Statistics, Statistics, Statistics, EngramEditor]:
+    """Collect independent answer-token-masked forget, retain, and total statistics."""
+    editor = EngramEditor(model, EditorConfig(storage_device=torch.device(device)))
+    feats = lambda b: {"input_ids": b["input_ids"].to(device), "attention_mask": b["attention_mask"].to(device)}
+    mask = lambda b: b["labels"] != IGNORE
+
+    def one(key: str, rows) -> Statistics:
+        path = (cache or {}).get(key)
+        if path:
+            import os
+            if os.path.exists(path):
+                return Statistics.load(path, map_location=device)
+        dl = DataLoader(_QA(rows, tok), batch_size=bs, collate_fn=_collate(tok.pad_token_id))
+        st = editor.collect_statistics(dl, batch_fn=feats, mask_fn=mask)
+        if path:
+            st.save(path)
+        return st
+
+    forget = one("forget", splits["forget"])
+    retain = one("retain", splits["retain_training"])
+    total = one("total", splits["total_training"])
+    return forget, retain, total, editor
 
 
 def run(
